@@ -1572,6 +1572,10 @@
             @if (ev.count > 10) {
               <button type="button" class="btn g" (click)="ToggleEvidenceAll()">{{ EvidenceAll ? 'Show only the 10 biggest' : 'Show all ' + ev.count + ' rows' }}</button>
             }
+            @if (ExplainKey === 'OUTSTANDING' && !ClientCode) {
+              <button type="button" class="btn g" (click)="ExportAllBills()" [disabled]="AllBillsBusy"
+                      title="Every open bill and every credit, for all clients, with a subtotal per client">{{ AllBillsBusy ? 'Preparing...' : 'Export every bill (all clients)' }}</button>
+            }
             <button type="button" class="btn g" (click)="ExportEvidence()">Export the full list</button>
           </div>
         }

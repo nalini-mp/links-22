@@ -112,6 +112,13 @@ export class FinanceDashboardComponent implements OnInit {
     UnmLinesAll: any[] = [];
     UnmJob: any = null;            // the job row whose lines are open
     UnmPending: string = null;     // job we should open once the client load finishes
+    /*  Table17/Table18: every open bill and every credit behind ONE client's
+        Outstanding. Only filled when a single client is selected - across all clients it
+        would be tens of thousands of rows. They prove the card:
+            sum(bill PENDING) - sum(credit AMOUNT) = that client's Outstanding  */
+    OsBills: any[] = [];
+    OsCredits: any[] = [];
+    AllBillsBusy = false;          // the whole-book export is fetching
     CacheInfo: any = null;         // CACHEINFO appended by the API cache
 
     /* expanded-row state for the Margin (per client) and Unbilled (per job) drills */
@@ -368,6 +375,8 @@ export class FinanceDashboardComponent implements OnInit {
                 this.JobSplit = data.Table13 ? data.Table13 : [];
                 this.FyYears = data.Table15 ? data.Table15 : [];
                 this.UnmLinesAll = data.Table16 ? data.Table16 : [];
+                this.OsBills = data.Table17 ? data.Table17 : [];
+                this.OsCredits = data.Table18 ? data.Table18 : [];
                 if (this.UnmPending) {
                     const jb = this.UnmPending;
                     this.UnmPending = null;
@@ -1191,7 +1200,121 @@ export class FinanceDashboardComponent implements OnInit {
     }
 
     /* the full list, not the ten on screen */
+    /*  With one client selected, the Outstanding export is the proof rather than the
+        summary: every open bill, then every credit set against it, in one sheet that
+        subtracts to the figure on the card.  */
+    private outstandingProof(): any {
+        if (this.ExplainKey !== 'OUTSTANDING' || !this.OsBills.length) { return null; }
+        const rows: any[] = [];
+        this.OsBills.forEach(b => rows.push([
+            b.KIND_, '', b.INV_NO, b.INV_DATE, b.DUE_DATE,
+            this.num(b.DAYS_OVERDUE) > 0 ? this.num(b.DAYS_OVERDUE) : '',
+            this.num(b.BILL_AMT), this.num(b.RECEIVED), this.num(b.PENDING), '']));
+        const billed = this.OsBills.reduce((s, b) => s + this.num(b.PENDING), 0);
+        rows.push(['BILLS PENDING - TOTAL', '', '', '', '', '', '', '', billed, '']);
+        rows.push(['', '', '', '', '', '', '', '', '', '']);
+        this.OsCredits.forEach(c => rows.push([
+            c.CATEGORY, c.VCH_TYPE, c.REFNO, c.REF_DATE, '', '', '', '', '',
+            this.num(c.AMOUNT)]));
+        const cred = this.OsCredits.reduce((s, c) => s + this.num(c.AMOUNT), 0);
+        rows.push(['CREDIT APPLIED - TOTAL', '', '', '', '', '', '', '', '', cred]);
+        rows.push(['', '', '', '', '', '', '', '', '', '']);
+        rows.push(['OUTSTANDING (bills pending less credit)', '', '', '', '', '', '', '',
+                   billed - cred, '']);
+        return {
+            headers: ['Section', 'Type', 'Reference', 'Date', 'Due date', 'Days late',
+                      'Bill amount', 'Received', 'Pending', 'Credit'],
+            rows: rows,
+            file: 'Outstanding_proof'
+        };
+    }
+
+    /*  One sheet per client is the proof of a client's figure; this is the proof of the
+        whole card. Fetched only when asked for - it is 5,000+ bills on Links, which has
+        no business riding on every page load.
+        Credit is capped at each client's own bills, because the card floors every client
+        at zero: one client's surplus never pays another's dues. Capped this way the
+        OUTSTANDING lines add up to the card exactly.  */
+    ExportAllBills() {
+        if (this.AllBillsBusy) { return; }
+        this.AllBillsBusy = true;
+        this._dataService.getData('Accounts/ACC_RPT_FINANCE_DASHBOARD', {
+            FROMDATE: this.fmtDate(this.FromDate),
+            TODATE: this.fmtDate(this.ToDate),
+            CMPCODE: this._loginService.getLogin()[0].CMPCODE,
+            CITYCODE: this.Branch,
+            CLIENTCODE: 'ALL-BILLS',
+            TOPN: this.TopN
+        }).subscribe((data: any) => {
+            this.AllBillsBusy = false;
+            const bills = (data && data.Table17) ? data.Table17 : [];
+            const creds = (data && data.Table18) ? data.Table18 : [];
+            if (!bills.length) {
+                this._toasterService.toast('warning', 'warning', 'Nothing to export !');
+                return;
+            }
+            const byClient: any = {};
+            const order: string[] = [];
+            const slot = (code: string, name: string) => {
+                if (!byClient[code]) { byClient[code] = { name: name, bills: [], creds: [] }; order.push(code); }
+                return byClient[code];
+            };
+            bills.forEach(b => slot(b.CLIENTCODE, b.CLIENTNAME).bills.push(b));
+            creds.forEach(c => slot(c.CLIENTCODE, c.CLIENTNAME).creds.push(c));
+
+            const rows: any[] = [];
+            let gTotal = 0;
+            order.forEach(code => {
+                const g = byClient[code];
+                const billed = g.bills.reduce((s: number, b: any) => s + this.num(b.PENDING), 0);
+                const credit = g.creds.reduce((s: number, c: any) => s + this.num(c.AMOUNT), 0);
+                const used = credit > billed ? billed : credit;
+                const net = billed - used > 0 ? billed - used : 0;
+                gTotal += net;
+                g.bills.forEach((b: any) => rows.push([g.name, code, b.KIND_, '', b.INV_NO, b.INV_DATE,
+                    b.DUE_DATE, this.num(b.DAYS_OVERDUE) > 0 ? this.num(b.DAYS_OVERDUE) : '',
+                    this.num(b.BILL_AMT), this.num(b.RECEIVED), this.num(b.PENDING), '']));
+                rows.push([g.name, code, 'BILLS PENDING - TOTAL', '', '', '', '', '', '', '', billed, '']);
+                g.creds.forEach((c: any) => rows.push([g.name, code, c.CATEGORY, c.VCH_TYPE, c.REFNO,
+                    c.REF_DATE, '', '', '', '', '', this.num(c.AMOUNT)]));
+                if (credit > billed) {
+                    rows.push([g.name, code, 'CREDIT APPLIED (capped at this client\'s bills)',
+                               '', '', '', '', '', '', '', '', used]);
+                    rows.push([g.name, code, 'CREDIT LEFT OVER (cannot pay another client)',
+                               '', '', '', '', '', '', '', '', credit - used]);
+                } else if (credit > 0) {
+                    rows.push([g.name, code, 'CREDIT APPLIED - TOTAL', '', '', '', '', '', '', '', '', credit]);
+                }
+                rows.push([g.name, code, 'OUTSTANDING', '', '', '', '', '', '', '', net, '']);
+                rows.push(['', '', '', '', '', '', '', '', '', '', '', '']);
+            });
+            rows.push(['ALL CLIENTS', '', 'OUTSTANDING - TOTAL', '', '', '', '', '', '', '', gTotal, '']);
+
+            this.exportser.exportExceltry({
+                data: rows,
+                headers: ['Client', 'Code', 'Section', 'Type', 'Reference', 'Date', 'Due date',
+                          'Days late', 'Bill amount', 'Received', 'Pending', 'Credit'],
+                pagetype: 'FinanceDashboard', title: this.cmpnyname,
+                subtitle: 'Every bill and every credit behind Outstanding - ' + this.BranchLabel
+                    + ' - as on ' + this.fmtDate(this.ToDate)
+            }, 'FinanceDashboard_Outstanding_all_bills_');
+        }, () => {
+            this.AllBillsBusy = false;
+            this._toasterService.toast('error', 'error', 'The full list could not be loaded.');
+        });
+    }
+
     ExportEvidence() {
+        const proof = this.outstandingProof();
+        if (proof) {
+            this.exportser.exportExceltry({
+                data: proof.rows, headers: proof.headers, pagetype: 'FinanceDashboard',
+                title: this.cmpnyname,
+                subtitle: 'How Outstanding is made up - ' + this.ClientLabel() + ' - '
+                    + this.BranchLabel + ' - as on ' + this.fmtDate(this.ToDate)
+            }, 'FinanceDashboard_Outstanding_proof_');
+            return;
+        }
         const d = this.evidenceDef();
         if (!d || !d.rows.length) { this._toasterService.toast('warning', 'warning', 'Nothing to export !'); return; }
         const headers = d.cols.map((c: any) => c.label);
